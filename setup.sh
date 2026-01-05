@@ -1,16 +1,20 @@
 #!/bin/bash
 
 ##############################################################################
-# Скрипт автоматической настройки окружения сервера v2.0
+# Скрипт автоматической настройки окружения сервера v2.1
 # Поддерживает: Rocky Linux, RHEL, Ubuntu, Debian
 # Автор: Server Setup Script
 # Лицензия: MIT
 ##############################################################################
 
 set -euo pipefail
+umask 022
 
 # Версия скрипта
-VERSION="2.0.0"
+VERSION="2.1.0"
+
+# URL репозитория для обновлений
+REPO_RAW="https://raw.githubusercontent.com/txd3h/server-setup/main/setup.sh"
 
 # Цвета для вывода
 RED='\033[0;31m'
@@ -27,6 +31,10 @@ BACKUP_DIR="/root/server-setup-backups/$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="/var/log/server-setup.log"
 INSTALL_MC=true
 INSTALL_VIM=true
+COMPONENTS_SPECIFIED=false
+
+# Ранняя инициализация лога
+touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/server-setup.log"
 
 # Функции для вывода
 print_info() {
@@ -55,6 +63,25 @@ print_debug() {
     fi
 }
 
+# Универсальная функция для интерактивного ввода (работает с curl | bash)
+ask() {
+    local prompt="$1"
+    local default="${2:-}"
+    local reply
+    # Читаем с терминала напрямую, чтобы работать через pipe/sudo
+    if read -r -p "$prompt" reply < /dev/tty 2>/dev/null; then
+        :
+    else
+        reply="$default"
+    fi
+    echo "${reply:-$default}"
+}
+
+# Получение домашней директории пользователя (безопасный способ)
+get_home() {
+    getent passwd "$1" 2>/dev/null | cut -d: -f6
+}
+
 # Показать справку
 show_help() {
     cat << EOF
@@ -63,7 +90,7 @@ show_help() {
 Использование: $0 [ОПЦИИ]
 
 ОПЦИИ:
-    -m, --mode MODE          Режим установки (current|all|current_and_new|all_and_new)
+    -m, --mode MODE          Режим установки (current|all|all_and_new)
     -c, --components COMP    Компоненты для установки (mc,vim или all) [default: all]
     -s, --silent             Тихий режим (без интерактивных вопросов)
     -d, --dry-run            Показать что будет сделано без реальных изменений
@@ -74,7 +101,6 @@ show_help() {
 РЕЖИМЫ:
     current                  Только для текущего пользователя
     all                      Для всех существующих пользователей
-    current_and_new          Для текущего пользователя и новых (через /etc/skel)
     all_and_new              Для всех существующих и новых пользователей
 
 ПРИМЕРЫ:
@@ -84,12 +110,47 @@ show_help() {
     $0 --dry-run                          # Посмотреть что будет сделано
     $0 -m current --backup-dir /tmp/bak   # Использовать свою директорию для бэкапов
 
+УСТАНОВКА:
+    # Рекомендуемый способ (проверка перед запуском):
+    curl -fsSL $REPO_RAW -o setup.sh
+    less setup.sh  # Проверьте содержимое!
+    sudo bash setup.sh
+
+    # Быстрая установка (на свой риск):
+    curl -fsSL $REPO_RAW | sudo bash
+
 EOF
 }
 
 # Показать версию
 show_version() {
     echo "Server Setup Script v${VERSION}"
+}
+
+# Парсинг компонентов
+parse_components() {
+    local components="$1"
+    COMPONENTS_SPECIFIED=true
+    INSTALL_MC=false
+    INSTALL_VIM=false
+    
+    if [[ "$components" == "all" ]]; then
+        INSTALL_MC=true
+        INSTALL_VIM=true
+        return
+    fi
+    
+    IFS=',' read -ra COMP_ARRAY <<< "$components"
+    for comp in "${COMP_ARRAY[@]}"; do
+        case "$comp" in
+            mc) INSTALL_MC=true ;;
+            vim) INSTALL_VIM=true ;;
+            *)
+                print_error "Неизвестный компонент: $comp"
+                exit 1
+                ;;
+        esac
+    done
 }
 
 # Парсинг аргументов командной строки
@@ -134,30 +195,6 @@ parse_arguments() {
     done
 }
 
-# Парсинг компонентов
-parse_components() {
-    local components="$1"
-    INSTALL_MC=false
-    INSTALL_VIM=false
-    
-    if [[ "$components" == "all" ]]; then
-        INSTALL_MC=true
-        INSTALL_VIM=true
-    else
-        IFS=',' read -ra COMP_ARRAY <<< "$components"
-        for comp in "${COMP_ARRAY[@]}"; do
-            case "$comp" in
-                mc) INSTALL_MC=true ;;
-                vim) INSTALL_VIM=true ;;
-                *)
-                    print_error "Неизвестный компонент: $comp"
-                    exit 1
-                    ;;
-            esac
-        done
-    fi
-}
-
 # Проверка прав root
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -190,7 +227,8 @@ backup_file() {
     local file="$1"
     if [ -f "$file" ]; then
         if [ "$DRY_RUN" = false ]; then
-            local backup_path="$BACKUP_DIR/$(dirname "$file")"
+            local rel_path="${file#/}"
+            local backup_path="$BACKUP_DIR/$(dirname "$rel_path")"
             mkdir -p "$backup_path"
             cp -a "$file" "$backup_path/$(basename "$file")"
             print_debug "Создан бэкап: $file -> $backup_path"
@@ -212,18 +250,16 @@ show_setup_menu() {
     echo "----------------------------------------"
     echo "1) Только для текущего пользователя ($(get_real_user))"
     echo "2) Для всех существующих пользователей"
-    echo "3) Для текущего пользователя и всех новых (через /etc/skel)"
-    echo "4) Для всех существующих и новых пользователей"
+    echo "3) Для всех существующих и новых пользователей"
     echo "----------------------------------------"
     
     local choice
     while true; do
-        read -p "Ваш выбор [1-4]: " choice
+        choice=$(ask "Ваш выбор [1-3]: ")
         case $choice in
             1) SETUP_MODE="current"; break ;;
             2) SETUP_MODE="all"; break ;;
-            3) SETUP_MODE="current_and_new"; break ;;
-            4) SETUP_MODE="all_and_new"; break ;;
+            3) SETUP_MODE="all_and_new"; break ;;
             *)
                 print_warn "Неверный выбор, попробуйте еще раз"
                 ;;
@@ -235,7 +271,7 @@ show_setup_menu() {
 
 # Меню выбора компонентов
 show_components_menu() {
-    if [ "$INSTALL_MC" = true ] && [ "$INSTALL_VIM" = true ]; then
+    if [ "$COMPONENTS_SPECIFIED" = true ]; then
         # Компоненты уже выбраны через параметры
         return
     fi
@@ -257,7 +293,7 @@ show_components_menu() {
     
     local choice
     while true; do
-        read -p "Ваш выбор [1-3]: " choice
+        choice=$(ask "Ваш выбор [1-3]: ")
         case $choice in
             1)
                 INSTALL_MC=true
@@ -317,7 +353,7 @@ is_package_installed() {
             rpm -q "$package" &> /dev/null
             ;;
         ubuntu|debian)
-            dpkg -l "$package" 2>/dev/null | grep -q "^ii"
+            dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q "install ok installed"
             ;;
         *)
             return 1
@@ -377,6 +413,41 @@ install_packages() {
     print_info "Пакеты установлены успешно"
 }
 
+# Установка Vim как редактора по умолчанию
+setup_vim_as_default() {
+    if [ "$INSTALL_VIM" = false ]; then
+        return
+    fi
+    
+    print_info "Установка Vim как редактора по умолчанию..."
+    
+    if [ "$DRY_RUN" = true ]; then
+        print_debug "DRY-RUN: установил бы Vim как редактор по умолчанию"
+        return
+    fi
+    
+    case $OS in
+        ubuntu|debian)
+            if command -v update-alternatives &> /dev/null; then
+                update-alternatives --set editor /usr/bin/vim.basic 2>/dev/null || \
+                update-alternatives --set editor /usr/bin/vim 2>/dev/null || \
+                print_warn "Не удалось установить Vim как редактор по умолчанию через update-alternatives"
+            fi
+            ;;
+        rocky|rhel|centos|fedora)
+            # В RHEL-based системах используем переменную окружения
+            if ! grep -q "EDITOR=vim" /etc/environment 2>/dev/null; then
+                echo "EDITOR=vim" >> /etc/environment
+            fi
+            if ! grep -q "VISUAL=vim" /etc/environment 2>/dev/null; then
+                echo "VISUAL=vim" >> /etc/environment
+            fi
+            ;;
+    esac
+    
+    print_debug "Vim установлен как редактор по умолчанию"
+}
+
 # Получение списка пользователей для настройки
 get_users_list() {
     local users=()
@@ -384,7 +455,13 @@ get_users_list() {
     case $SETUP_MODE in
         current)
             local real_user=$(get_real_user)
-            users+=("$real_user:$(eval echo ~$real_user)")
+            local user_home=$(get_home "$real_user")
+            if [ -n "$user_home" ]; then
+                users+=("$real_user:$user_home")
+            else
+                print_error "Не удалось определить домашнюю директорию для $real_user"
+                exit 1
+            fi
             ;;
         all)
             while IFS=: read -r username _ uid _ _ home shell; do
@@ -399,11 +476,6 @@ get_users_list() {
                     fi
                 fi
             done < /etc/passwd
-            ;;
-        current_and_new)
-            local real_user=$(get_real_user)
-            users+=("$real_user:$(eval echo ~$real_user)")
-            users+=("skel:/etc/skel")
             ;;
         all_and_new)
             while IFS=: read -r username _ uid _ _ home shell; do
@@ -821,19 +893,19 @@ create_update_script() {
         return
     fi
     
-    cat > /usr/local/bin/update-server-config << 'SCRIPT'
+    cat > /usr/local/bin/update-server-config << SCRIPT
 #!/bin/bash
 # Скрипт для обновления конфигурации с GitHub
 
-REPO_URL="https://raw.githubusercontent.com/txd3h/server-setup/main/setup.sh"
+REPO_URL="$REPO_RAW"
 TEMP_FILE="/tmp/setup-update.sh"
 
 echo "Загрузка обновленного скрипта настройки..."
-if curl -fsSL "$REPO_URL" -o "$TEMP_FILE"; then
-    chmod +x "$TEMP_FILE"
+if curl -fsSL "\$REPO_URL" -o "\$TEMP_FILE"; then
+    chmod +x "\$TEMP_FILE"
     echo "Запуск обновленного скрипта..."
-    "$TEMP_FILE" "$@"
-    rm -f "$TEMP_FILE"
+    "\$TEMP_FILE" "\$@"
+    rm -f "\$TEMP_FILE"
 else
     echo "Ошибка при загрузке обновления"
     exit 1
@@ -866,10 +938,6 @@ print_summary() {
         all)
             echo "Настройки применены для всех существующих пользователей"
             ;;
-        current_and_new)
-            echo "Настройки применены для: $real_user"
-            echo "Настройки будут применены для всех новых пользователей"
-            ;;
         all_and_new)
             echo "Настройки применены для всех существующих пользователей"
             echo "Настройки будут применены для всех новых пользователей"
@@ -882,13 +950,14 @@ print_summary() {
     [ "$INSTALL_MC" = true ] && echo "    - Сохранением путей панелей"
     [ "$INSTALL_MC" = true ] && echo "    - Сохранением пути при выходе"
     [ "$INSTALL_MC" = true ] && echo "    - Поддержкой 256 цветов"
-    [ "$INSTALL_MC" = true ] && echo "    - Настроенным скином"
+    [ "$INSTALL_MC" = true ] && echo "    - Скином modarin256"
     [ "$INSTALL_MC" = true ] && echo ""
     [ "$INSTALL_VIM" = true ] && echo "  ✓ Vim с:"
     [ "$INSTALL_VIM" = true ] && echo "    - Нумерацией строк"
     [ "$INSTALL_VIM" = true ] && echo "    - Режимом вставки без отступов (F2)"
     [ "$INSTALL_VIM" = true ] && echo "    - Подсветкой синтаксиса"
     [ "$INSTALL_VIM" = true ] && echo "    - Удобными настройками"
+    [ "$INSTALL_VIM" = true ] && echo "    - Установлен как редактор по умолчанию"
     echo ""
     
     if [ "$DRY_RUN" = false ]; then
@@ -915,9 +984,6 @@ main() {
     echo "=========================================="
     echo ""
     
-    # Инициализация лога
-    touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/server-setup.log"
-    
     check_root
     detect_os
     
@@ -932,6 +998,7 @@ main() {
     
     create_backup_dir
     install_packages
+    setup_vim_as_default
     setup_mc
     setup_vim
     create_update_script
