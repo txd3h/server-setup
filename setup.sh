@@ -825,7 +825,7 @@ create_update_script() {
 #!/bin/bash
 # Скрипт для обновления конфигурации с GitHub
 
-REPO_URL="https://raw.githubusercontent.com/YOUR_USERNAME/server-setup/main/setup.sh"
+REPO_URL="https://raw.githubusercontent.com/txd3h/server-setup/main/setup.sh"
 TEMP_FILE="/tmp/setup-update.sh"
 
 echo "Загрузка обновленного скрипта настройки..."
